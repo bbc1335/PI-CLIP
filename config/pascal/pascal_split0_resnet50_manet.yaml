@@ -1,13 +1,13 @@
 Data:
-  data_root: ../data/VOCdevkit2012/VOC2012
-  base_data_root: ../data/base_annotation/pascal/
-  annotation_root: ../data/VOCdevkit2012/VOC2012/Annotations/
+  data_root: /home/bbc1335/Documents/Dataset/VOCdevkit/VOC2012
+  base_data_root: /home/bbc1335/Documents/Dataset/VOCdevkit/VOC2012/base_annotation/pascal
+  annotation_root: /home/bbc1335/Documents/Dataset/VOCdevkit/VOC2012/Annotations/
   train_list: ./lists/pascal/voc_sbd_merge_noduplicate.txt
   val_list: ./lists/pascal/val.txt
   classes: 2
 
 CLIP:
-  clip_path: ../initmodel/clip/ViT-B-16.pt
+  clip_path: ./initmodel/clip/ViT-B-16.pt
 
 Train:
   # Aug
@@ -28,7 +28,7 @@ Train:
   # Optimizer
   batch_size: 8 # batch size for training (bs8 for 1GPU)
   base_lr: 0.0001 
-  pre_weight: ../initmodel/PSPNet/pascal/split0/resnet50/best.pth
+  pre_weight: ./initmodel/PSPNet/pascal/split0/resnet50/best.pth
   epochs: 200
   start_epoch: 0 
   stop_interval: 80 # stop when the best result is not updated for "stop_interval" epochs
@@ -67,6 +67,6 @@ Method:
   merge_tau: 0.9     # fusion threshold tau
 
 Test_Finetune:
-  weight:  # Path to the test model
+  weight: # Path to the test model
   ann_type: 'mask' # mask/bbox
 

@@ -31,7 +31,7 @@ cv2.setNumThreads(0)
 
 def get_parser():
     parser = argparse.ArgumentParser(description='PyTorch Few-Shot Semantic Segmentation')
-    parser.add_argument('--arch', type=str, default='PI_CLIP')
+    parser.add_argument('--arch', type=str, default='PI_CLIP') # type: ignore
     parser.add_argument('--viz', action='store_true', default=False)
     # parser.add_argument('--config', type=str, default='config/pascal/pascal_split0_resnet50_manet.yaml',
     #                     help='config file')
@@ -110,44 +110,63 @@ def main_process():
 
 
 def main():
-
+    """
+    训练流程的主入口函数
+    
+    负责以下任务：
+    1. 解析配置参数和初始化日志
+    2. 创建模型和优化器
+    3. 构建训练集和验证集的数据加载器
+    4. 执行训练-验证循环
+    5. 保存检查点和记录最佳结果
+    """
     global args, logger, writer
-    args = get_parser()
-    logger = get_logger()
-    args.distributed = True if torch.cuda.device_count() > 1 else False
+    
+    # ==================== 初始化配置 ====================
+    args = get_parser()  # 解析命令行参数和配置文件
+    logger = get_logger()  # 初始化日志记录器
+    args.distributed = True if torch.cuda.device_count() > 1 else False  # 根据GPU数量判断是否使用分布式训练
     if main_process():
-        print(args)
+        print(args)  # 打印配置参数（仅在主进程）
 
+    # 设置随机种子以保证实验可重复性
     if args.manual_seed is not None:
         setup_seed(args.manual_seed, args.seed_deterministic)
 
-    assert args.classes > 1
-    assert args.zoom_factor in [1, 2, 4, 8]
-    assert (args.train_h - 1) % 8 == 0 and (args.train_w - 1) % 8 == 0
+    # 参数合法性检查
+    assert args.classes > 1  # 类别数必须大于1
+    assert args.zoom_factor in [1, 2, 4, 8]  # 缩放因子必须是特定值（与网络下采样倍数匹配）
+    assert (args.train_h - 1) % 8 == 0 and (args.train_w - 1) % 8 == 0  # 输入尺寸需满足网络要求
 
+    # ==================== 模型构建 ====================
     if main_process():
         logger.info("=> creating model ...")
-    model, optimizer = get_model(args)
+    model, optimizer = get_model(args)  # 创建模型和优化器（包含resume逻辑）
     if main_process():
-        logger.info(model)
+        logger.info(model)  # 打印模型结构
     if main_process() and args.viz:
-        writer = SummaryWriter(args.result_path)
+        writer = SummaryWriter(args.result_path)  # 初始化TensorBoard可视化工具
 
-    # ----------------------  DATASET  ----------------------
+    # ==================== 数据预处理配置 ====================
+    # ImageNet数据集的归一化参数（RGB通道）
     value_scale = 255
-    mean = [0.485, 0.456, 0.406]
-    mean = [item * value_scale for item in mean]
-    std = [0.229, 0.224, 0.225]
-    std = [item * value_scale for item in std]
-    # Train
+    mean = [0.485, 0.456, 0.406]  # ImageNet均值
+    mean = [item * value_scale for item in mean]  # 转换到[0,255]范围
+    std = [0.229, 0.224, 0.225]  # ImageNet标准差
+    std = [item * value_scale for item in std]  # 转换到[0,255]范围
+    
+    # ----------------------  训练集数据增强  ----------------------
+    # 标准训练变换（用于查询图像）
     train_transform = transform.Compose([
-        transform.RandScale([args.scale_min, args.scale_max]),
-        transform.RandRotate([args.rotate_min, args.rotate_max], padding=mean, ignore_label=args.padding_label),
-        transform.RandomGaussianBlur(),
-        transform.RandomHorizontalFlip(),
-        transform.Resize([args.train_h, args.train_w]),
-        transform.ToTensor(),
-        transform.Normalize(mean=mean, std=std)])
+        transform.RandScale([args.scale_min, args.scale_max]),  # 随机缩放
+        transform.RandRotate([args.rotate_min, args.rotate_max], padding=mean, ignore_label=args.padding_label),  # 随机旋转
+        transform.RandomGaussianBlur(),  # 随机高斯模糊
+        transform.RandomHorizontalFlip(),  # 随机水平翻转
+        transform.Resize([args.train_h, args.train_w]),  # 调整到固定尺寸
+        transform.ToTensor(),  # 转换为Tensor
+        transform.Normalize(mean=mean, std=std)])  # 归一化
+    
+    # 三元组训练变换（用于支持图像，保持与查询图像相同的增强策略）
     train_transform_tri = transform_tri.Compose([
         transform_tri.RandScale([args.scale_min, args.scale_max]),
         transform_tri.RandRotate([args.rotate_min, args.rotate_max], padding=mean, ignore_label=args.padding_label),
@@ -156,18 +175,25 @@ def main():
         transform_tri.Resize([args.train_h, args.train_w]),
         transform_tri.ToTensor(),
         transform_tri.Normalize(mean=mean, std=std)])
+    
+    # 构建训练数据集
     if args.data_set == 'pascal' or args.data_set == 'coco':
         train_data = dataset.SemData(split=args.split, shot=args.shot, data_root=args.data_root,
                                      base_data_root=args.base_data_root, data_list=args.train_list, \
                                      transform=train_transform, transform_tri=train_transform_tri, mode='train', \
                                      data_set=args.data_set, use_split_coco=args.use_split_coco)
+    
+    # 分布式训练采样器（确保每个GPU看到不同的数据）
     train_sampler = DistributedSampler(train_data) if args.distributed else None
     train_loader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size, num_workers=args.workers, \
                                                pin_memory=True, sampler=train_sampler, drop_last=True, \
-                                               shuffle=False if args.distributed else True)
-    # Val
+                                               shuffle=False if args.distributed else True)  # 分布式时使用sampler控制shuffle
+    
+    # ----------------------  验证集数据预处理  ----------------------
     if args.evaluate:
+        # 根据配置选择验证集的resize策略
         if args.resized_val:
+            # 直接resize到指定尺寸（可能改变宽高比）
             val_transform = transform.Compose([
                 transform.Resize(size=args.val_size),
                 transform.ToTensor(),
@@ -177,6 +203,7 @@ def main():
                 transform_tri.ToTensor(),
                 transform_tri.Normalize(mean=mean, std=std)])
         else:
+            # 保持宽高比的resize（短边对齐，长边padding）
             val_transform = transform.Compose([
                 transform.test_Resize(size=args.val_size),
                 transform.ToTensor(),
@@ -185,59 +212,73 @@ def main():
                 transform_tri.test_Resize(size=args.val_size),
                 transform_tri.ToTensor(),
                 transform_tri.Normalize(mean=mean, std=std)])
+        
+        # 构建验证数据集
         if args.data_set == 'pascal' or args.data_set == 'coco':
             val_data = dataset.SemData(split=args.split, shot=args.shot, data_root=args.data_root,
                                        base_data_root=args.base_data_root, data_list=args.val_list, \
                                        transform=val_transform, transform_tri=val_transform_tri, mode='val', \
                                        data_set=args.data_set, use_split_coco=args.use_split_coco)
+        # 验证集dataloader（不shuffle，不使用分布式采样）
         val_loader = torch.utils.data.DataLoader(val_data, batch_size=args.batch_size_val, shuffle=False,
                                                  num_workers=args.workers, pin_memory=False, sampler=None)
 
-    # ----------------------  TRAINVAL  ----------------------
+    # ==================== 训练循环初始化 ====================
+    # 初始化全局最佳性能指标
     global best_miou, best_FBiou, best_piou, best_epoch, keep_epoch, val_num
     global best_miou_m, best_miou_b, best_FBiou_m
-    best_miou = 0.
-    best_FBiou = 0.
-    best_piou = 0.
-    best_epoch = 0
-    keep_epoch = 0
-    val_num = 0
-    best_miou_m = 0.
-    best_miou_b = 0.
-    best_FBiou_m = 0.
+    best_miou = 0.  # 最佳平均IoU
+    best_FBiou = 0.  # 最佳前景背景IoU
+    best_piou = 0.  # 最佳原型IoU
+    best_epoch = 0  # 达到最佳性能的epoch
+    keep_epoch = 0  # 连续未改进的epoch计数（用于早停）
+    val_num = 0  # 验证次数
+    best_miou_m = 0.  # 最佳多尺度平均IoU
+    best_miou_b = 0.  # 最佳边界IoU
+    best_FBiou_m = 0.  # 最佳多尺度前景背景IoU
 
-    start_time = time.time()
+    start_time = time.time()  # 记录训练开始时间
 
+    # ==================== 主训练循环 ====================
     for epoch in range(args.start_epoch, args.epochs):
+        # 早停机制：如果连续stop_interval个epoch没有改进，则停止训练
         if keep_epoch == args.stop_interval:
             break
+        
+        # 每个epoch使用不同的随机种子（可选）
         if args.fix_random_seed_val:
             setup_seed(args.manual_seed + epoch, args.seed_deterministic)
 
-        epoch_log = epoch + 1
-        keep_epoch += 1
+        epoch_log = epoch + 1  # 用于日志的epoch编号（从1开始）
+        keep_epoch += 1  # 增加未改进计数
+        
+        # 分布式训练：每个epoch重新设置采样器种子
         if args.distributed:
             train_sampler.set_epoch(epoch)
 
-            # ----------------------  TRAIN  ----------------------
+        # ----------------------  训练一个epoch  ----------------------
         loss_train, mIoU_train, mAcc_train, allAcc_train = train(train_loader, val_loader, model, optimizer, epoch)
 
+        # 记录训练指标到TensorBoard
         if main_process() and args.viz:
             writer.add_scalar('FBIoU_train', mIoU_train, epoch_log)
 
-        # save model for <resuming>
+        # 定期保存检查点（用于断点续训）
         if (epoch % args.save_freq == 0) and (epoch > 0) and main_process():
             filename = args.snapshot_path + '/epoch_{}.pth'.format(epoch)
             logger.info('Saving checkpoint to: ' + filename)
             if osp.exists(filename):
-                os.remove(filename)
+                os.remove(filename)  # 删除旧文件
             torch.save({'epoch': epoch, 'state_dict': model.state_dict(), 'optimizer': optimizer.state_dict()},
                        filename)
 
-        # -----------------------  VAL  -----------------------
+        # -----------------------  验证  -----------------------
+        # 每个epoch都进行验证（epoch % 1 == 0 恒为True）
         if args.evaluate and epoch % 1 == 0:
             loss_val, FBIoU, FBIoU_m, mIoU, mIoU_m, mIoU_b, pIoU = validate(val_loader, model)
-            val_num += 1
+            val_num += 1  # 验证次数加1
+            
+            # 记录验证指标到TensorBoard
             if main_process() and args.viz:
                 writer.add_scalar('loss_val', loss_val, epoch_log)
                 writer.add_scalar('FBIoU_val', FBIoU, epoch_log)
@@ -246,7 +287,7 @@ def main():
                 writer.add_scalar('mIoU_val_b', mIoU_b, epoch_log)
                 writer.add_scalar('FBIoU_val_m', FBIoU_m, epoch_log)
 
-            # save model for <testing>
+            # 如果当前性能超过历史最佳，保存最佳模型（用于最终测试）
             if mIoU > best_miou:
                 best_miou, best_FBiou, best_piou, best_epoch = mIoU, FBIoU, pIoU, epoch
                 best_miou_m, best_miou_b, best_FBiou_m = mIoU_m, mIoU_b, FBIoU_m
@@ -278,73 +319,108 @@ def main():
 
 
 def train(train_loader, val_loader, model, optimizer, epoch):
+    """
+    训练一个epoch的主函数
+    
+    Args:
+        train_loader: 训练数据加载器
+        val_loader: 验证数据加载器
+        model: 待训练的模型
+        optimizer: 优化器
+        epoch: 当前训练轮数
+    
+    Returns:
+        main_loss_meter.avg: 平均主损失
+        mIoU: 平均交并比
+        mAcc: 平均类别准确率
+        allAcc: 全局准确率
+    """
+    # 声明全局变量，用于跟踪最佳模型性能指标
     global best_miou, best_FBiou, best_piou, best_epoch, keep_epoch, val_num
     global best_miou_m, best_miou_b, best_FBiou_m
-    batch_time = AverageMeter()
-    data_time = AverageMeter()
-    main_loss_meter = AverageMeter()
-    aux_loss_meter1 = AverageMeter()
-    aux_loss_meter2 = AverageMeter()
-    loss_meter = AverageMeter()
-    intersection_meter = AverageMeter()
-    union_meter = AverageMeter()
-    target_meter = AverageMeter()
+    
+    # 初始化各种统计指标的平均值计算器
+    batch_time = AverageMeter()  # 批次处理时间
+    data_time = AverageMeter()  # 数据加载时间
+    main_loss_meter = AverageMeter()  # 主损失值
+    aux_loss_meter1 = AverageMeter()  # 辅助损失1
+    aux_loss_meter2 = AverageMeter()  # 辅助损失2
+    loss_meter = AverageMeter()  # 总损失
+    intersection_meter = AverageMeter()  # 预测与标签的交集
+    union_meter = AverageMeter()  # 预测与标签的并集
+    target_meter = AverageMeter()  # 真实标签统计
 
-    model.train()
+    model.train()  # 设置模型为训练模式
     if args.fix_bn:
-        model.apply(fix_bn)  # fix batchnorm
+        model.apply(fix_bn)  # 固定BatchNorm层的参数，防止其在训练过程中更新
 
-    end = time.time()
-    val_time = 0.
-    max_iter = args.epochs * len(train_loader)
+    end = time.time()  # 记录起始时间
+    val_time = 0.  # 验证过程耗时
+    max_iter = args.epochs * len(train_loader)  # 计算最大迭代次数
     if main_process():
-        print('Warmup: {}'.format(args.warmup))
+        print('Warmup: {}'.format(args.warmup))  # 打印学习率预热信息
 
+    # 遍历训练数据加载器，i为批次索引
     for i, (input, input_name, target, target_b, s_input, s_mask, subcls, class_name, img_cv2) in enumerate(train_loader):
 
-        data_time.update(time.time() - end)
-        current_iter = epoch * len(train_loader) + i + 1
+        data_time.update(time.time() - end)  # 更新数据加载时间
+        current_iter = epoch * len(train_loader) + i + 1  # 计算当前迭代次数
 
+        # 使用多项式学习率衰减策略更新学习率
         poly_learning_rate(optimizer, args.base_lr, current_iter, max_iter, power=args.power,
                            index_split=args.index_split, warmup=args.warmup, warmup_step=len(train_loader) // 2)
 
-        s_input = s_input.cuda(non_blocking=True)
-        s_mask = s_mask.cuda(non_blocking=True)
-        input = input.cuda(non_blocking=True)
-        img_cv2 = img_cv2.cuda(non_blocking=True)
-        target = target.cuda(non_blocking=True)
-        target_b = target_b.cuda(non_blocking=True)
+        # 将所有数据移动到GPU，non_blocking=True允许异步数据传输以提高效率
+        s_input = s_input.cuda(non_blocking=True)  # 支持样本图像
+        s_mask = s_mask.cuda(non_blocking=True)  # 支持样本掩码
+        input = input.cuda(non_blocking=True)  # 查询图像
+        img_cv2 = img_cv2.cuda(non_blocking=True)  # 原始图像（OpenCV格式）
+        target = target.cuda(non_blocking=True)  # 查询图像的标签
+        target_b = target_b.cuda(non_blocking=True)  # 边界标签
 
+        # 前向传播：模型接收支持集和查询集，输出预测结果和损失
+        # s_x: 支持图像, que_name: 查询图像名称, s_y: 支持掩码
+        # x: 查询图像, x_cv2: 查询图像原始格式, y_m: 查询掩码, y_b: 边界掩码
+        # cat_idx: 类别索引, class_name: 类别名称
         output, main_loss, aux_loss1, aux_loss2 = model(s_x=s_input, que_name=input_name, s_y=s_mask, x=input, x_cv2=img_cv2, y_m=target, y_b=target_b, cat_idx=subcls, class_name=class_name)
 
+        # 计算总损失：主损失 + 加权辅助损失
         loss = main_loss + args.aux_weight1 * aux_loss1 + args.aux_weight2 * aux_loss2
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        # 反向传播优化步骤
+        optimizer.zero_grad()  # 清零梯度
+        loss.backward()  # 计算梯度
+        optimizer.step()  # 更新参数
 
-        n = input.size(0)
+        n = input.size(0)  # 获取批次大小
 
+        # 计算预测结果与真实标签的交集、并集（用于计算IoU）
         intersection, union, target = intersectionAndUnionGPU(output, target, args.classes, args.ignore_label)
+        # 将GPU张量转换为CPU numpy数组以便统计
         intersection, union, target = intersection.cpu().numpy(), union.cpu().numpy(), target.cpu().numpy()
         intersection_meter.update(intersection), union_meter.update(union), target_meter.update(target)
 
+        # 计算当前批次的准确率（所有类别的平均准确率）
         accuracy = sum(intersection_meter.val) / (sum(target_meter.val) + 1e-10)  # allAcc
 
+        # 更新各项损失指标
         main_loss_meter.update(main_loss.item(), n)
         aux_loss_meter1.update(aux_loss1.item(), n)
         aux_loss_meter2.update(aux_loss2.item(), n)
         loss_meter.update(loss.item(), n)
 
+        # 更新批次处理时间（扣除验证时间）
         batch_time.update(time.time() - end - val_time)
-        end = time.time()
+        end = time.time()  # 更新结束时间
 
-        remain_iter = max_iter - current_iter
-        remain_time = remain_iter * batch_time.avg
-        t_m, t_s = divmod(remain_time, 60)
-        t_h, t_m = divmod(t_m, 60)
-        remain_time = '{:02d}:{:02d}:{:02d}'.format(int(t_h), int(t_m), int(t_s))
+        # 计算剩余训练时间
+        remain_iter = max_iter - current_iter  # 剩余迭代次数
+        remain_time = remain_iter * batch_time.avg  # 预估剩余时间（秒）
+        t_m, t_s = divmod(remain_time, 60)  # 转换为分钟和秒
+        t_h, t_m = divmod(t_m, 60)  # 转换为小时和分钟
+        remain_time = '{:02d}:{:02d}:{:02d}'.format(int(t_h), int(t_m), int(t_s))  # 格式化为 HH:MM:SS
 
+        # 按指定频率打印训练日志（仅在主进程打印）
         if (i + 1) % args.print_freq == 0 and main_process():
             logger.info('Epoch: [{}/{}][{}/{}] '
                         'Data {data_time.val:.3f} ({data_time.avg:.3f}) '
@@ -363,48 +439,65 @@ def train(train_loader, val_loader, model, optimizer, epoch):
                                                           aux_loss_meter2=aux_loss_meter2,
                                                           loss_meter=loss_meter,
                                                           accuracy=accuracy))
+            # 如果启用可视化，将损失值写入TensorBoard
             if args.viz:
                 writer.add_scalar('loss_train', loss_meter.val, current_iter)
                 writer.add_scalar('loss_train_main', main_loss_meter.val, current_iter)
                 writer.add_scalar('loss_train_aux1', aux_loss_meter1.val, current_iter)
                 writer.add_scalar('loss_train_aux2', aux_loss_meter2.val, current_iter)
 
-        # -----------------------  SubEpoch VAL  -----------------------
+        # -----------------------  子epoch验证  -----------------------
+        # 在训练中途进行验证的条件：
+        # 1. 启用评估模式
+        # 2. 启用子epoch验证
+        # 3. 总epoch数<=100且当前epoch>0
+        # 4. 当前批次为训练数据的一半位置
         if args.evaluate and args.SubEpoch_val and (args.epochs <= 100 and epoch % 1 == 0 and epoch > 0) and (
                 i == round(len(train_loader) / 2)):  # <if> max_epoch<=100 <do> half_epoch Val
+            # 执行验证并获取各项指标
             loss_val, FBIoU, FBIoU_m, mIoU, mIoU_m, mIoU_b, pIoU = validate(val_loader, model)
-            val_num += 1
-            # save model for <testing>
+            val_num += 1  # 验证次数加1
+            
+            # 如果当前mIoU超过历史最佳值，则保存模型
             if mIoU > best_miou:
+                # 更新最佳性能指标
                 best_miou, best_FBiou, best_piou, best_epoch = mIoU, FBIoU, pIoU, (epoch - 0.5)
                 best_miou_m, best_miou_b, best_FBiou_m = mIoU_m, mIoU_b, FBIoU_m
-                keep_epoch = 0
+                keep_epoch = 0  # 重置保持计数器
+                
+                # 根据shot数（支持样本数量）生成不同的文件名
                 if args.shot == 1:
                     filename = args.snapshot_path + '/train_epoch_' + str(epoch - 0.5) + '_{:.4f}'.format(
                         best_miou) + '.pth'
                 else:
                     filename = args.snapshot_path + '/train{}_epoch_'.format(args.shot) + str(
                         epoch - 0.5) + '_{:.4f}'.format(best_miou) + '.pth'
+                
+                # 在主进程中保存模型检查点
                 if main_process():
                     logger.info('Saving checkpoint to: ' + filename)
                     torch.save(
                         {'epoch': epoch - 0.5, 'state_dict': model.state_dict(), 'optimizer': optimizer.state_dict()},
                         filename)
 
+            # 验证结束后恢复模型到训练模式
             model.train()
             if args.fix_bn:
-                model.apply(fix_bn)  # fix batchnorm
+                model.apply(fix_bn)  # 重新固定BatchNorm层
 
-    iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)
-    accuracy_class = intersection_meter.sum / (target_meter.sum + 1e-10)
-    mIoU = np.mean(iou_class)
-    mAcc = np.mean(accuracy_class)
-    allAcc = sum(intersection_meter.sum) / (sum(target_meter.sum) + 1e-10)
+    # 一个epoch训练结束，计算最终的评估指标
+    iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)  # 各类别的IoU
+    accuracy_class = intersection_meter.sum / (target_meter.sum + 1e-10)  # 各类别的准确率
+    mIoU = np.mean(iou_class)  # 平均IoU
+    mAcc = np.mean(accuracy_class)  # 平均类别准确率
+    allAcc = sum(intersection_meter.sum) / (sum(target_meter.sum) + 1e-10)  # 全局准确率
 
+    # 在主进程中打印训练结果
     if main_process():
         logger.info(
             'Train result at epoch [{}/{}]: mIoU/mAcc/allAcc {:.4f}/{:.4f}/{:.4f}.'.format(epoch, args.epochs, mIoU,
                                                                                            mAcc, allAcc))
+        # 打印每个类别的详细结果
         for i in range(args.classes):
             logger.info('Class_{} Result: iou/accuracy {:.4f}/{:.4f}.'.format(i, iou_class[i], accuracy_class[i]))
 

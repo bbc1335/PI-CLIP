@@ -26,21 +26,46 @@ import torch.nn.init as initer
 
 
 class AverageMeter(object):
-    """Computes and stores the average and current value"""
+    """
+    计算并存储平均值和当前值的工具类
+    
+    在深度学习训练中广泛使用，用于统计损失值、准确率、处理时间等指标的
+    当前值（val）、累计和（sum）、样本数量（count）和平均值（avg）
+    """
     def __init__(self):
+        """初始化时调用reset方法重置所有统计变量"""
         self.reset()
 
     def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
+        """
+        重置所有统计变量为初始状态
+        在每个epoch开始或需要重新统计时调用
+        """
+        self.val = 0      # 当前批次的值（最新一次update传入的值）
+        self.avg = 0      # 所有批次的加权平均值
+        self.sum = 0      # 累计总和（考虑批次大小加权）
+        self.count = 0    # 累计样本数量
 
     def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
+        """
+        更新统计信息
+        
+        Args:
+            val: 当前批次的指标值（如损失值、准确率等）
+            n: 当前批次的样本数量，默认为1
+               使用n作为权重可以正确处理不同batch_size的情况
+        
+        示例:
+            # 假设batch_size=32，当前batch的损失为0.5
+            meter.update(0.5, n=32)
+            # 下一批batch_size=16，损失为0.6
+            meter.update(0.6, n=16)
+            # 此时 avg = (0.5*32 + 0.6*16) / (32+16) = 0.533
+        """
+        self.val = val              # 更新当前值
+        self.sum += val * n         # 累加加权值（值 × 样本数）
+        self.count += n             # 累加样本数量
+        self.avg = self.sum / self.count  # 计算加权平均值
 
 
 def step_learning_rate(optimizer, base_lr, epoch, step_epoch, multiplier=0.1):

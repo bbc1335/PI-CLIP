@@ -208,17 +208,20 @@ class SemData(Dataset):
 
     def __getitem__(self, index):
         image_path, label_path = self.data_list[index]
-        tmp_sperate = image_path.split('/')
-        if 'VOC' in image_path:
-            query_name = tmp_sperate[5]
-        else:
-            query_name = tmp_sperate[4]
+        query_name = os.path.basename(image_path)
         image = cv2.imread(image_path, cv2.IMREAD_COLOR)
+        if image is None:
+            raise FileNotFoundError("Image not found or unreadable: " + image_path)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         image = np.float32(image)
         img_cv2 = image.copy()
         label = cv2.imread(label_path, cv2.IMREAD_GRAYSCALE)
-        label_b = cv2.imread(os.path.join(self.base_path, label_path.split('/')[-1]), cv2.IMREAD_GRAYSCALE)
+        if label is None:
+            raise FileNotFoundError("Segmentation label not found or unreadable: " + label_path)
+        base_label_path = os.path.join(self.base_path, os.path.basename(label_path))
+        label_b = cv2.imread(base_label_path, cv2.IMREAD_GRAYSCALE)
+        if label_b is None:
+            raise FileNotFoundError("Base annotation not found or unreadable: " + base_label_path)
 
         if image.shape[0] != label.shape[0] or image.shape[1] != label.shape[1]:
             raise (RuntimeError("Query Image & label shape mismatch: " + image_path + " " + label_path + "\n"))

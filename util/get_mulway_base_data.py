@@ -31,10 +31,24 @@ from util import get_train_val_set, check_makedirs
 #     └── MSCOCO2014/
 
 parser = argparse.ArgumentParser()
+parser.add_argument('--data-set', choices=['pascal', 'coco'], default='pascal')
+parser.add_argument(
+    '--data-root',
+    default='/home/bbc1335/Documents/Dataset/VOCdevkit/VOC2012',
+    help='Dataset root containing the original images and annotations.',
+)
+parser.add_argument(
+    '--list-root',
+    default=None,
+    help=(
+        'Directory containing the train/val fss lists. If omitted, '
+        'lists/<data-set>/fss_list is used.'
+    ),
+)
 args = parser.parse_args()
 
-args.data_set = 'coco'  # pascal coco
 args.use_split_coco = True
+project_root = osp.dirname(osp.dirname(osp.abspath(__file__)))
 
 for sp in [0, 1, 2, 3]:
     for mm in ['train', 'val']:
@@ -45,8 +59,7 @@ for sp in [0, 1, 2, 3]:
         elif args.data_set == 'coco':
             num_classes = 80
 
-        # root_path = '/mnt/home/bhpeng22/githubProjects/fewshot_segmentation/data'
-        root_path = '/home/wj/code/HDMNet/data/MSCOCO2014'
+        root_path = args.data_root
         data_path = osp.join(root_path, 'base_annotation/')
         save_path = osp.join(data_path, args.data_set, args.mode, str(args.split))
         check_makedirs(save_path)
@@ -54,15 +67,42 @@ for sp in [0, 1, 2, 3]:
         # get class list
         sub_list, sub_val_list = get_train_val_set(args)
 
-        # get data_list
-        # fss_list_root = '/mnt/home/bhpeng22/githubProjects/fewshot_segmentation/FSS/lists/{}/fss_list/{}/'.format(args.data_set, args.mode)
-        fss_list_root = '/home/wj/code/PI_CLIP/lists/{}/fss_list/{}/'.format(args.data_set, args.mode)
-        fss_data_list_path = fss_list_root + 'data_list_{}.txt'.format(args.split)
+        # Locate the standard data list. An explicitly provided --list-root
+        # takes precedence over the project-local default.
+        if args.list_root is not None:
+            list_roots = [osp.abspath(args.list_root)]
+        else:
+            list_roots = [
+                osp.join(project_root, 'lists', args.data_set, 'fss_list'),
+            ]
+
+        fss_data_list_path = None
+        checked_paths = []
+        for list_root in list_roots:
+            candidate = osp.join(
+                list_root, args.mode, 'data_list_{}.txt'.format(args.split)
+            )
+            checked_paths.append(candidate)
+            if osp.isfile(candidate) and osp.getsize(candidate) > 0:
+                fss_data_list_path = candidate
+                break
+
+        if fss_data_list_path is None:
+            raise FileNotFoundError(
+                'Data list not found or empty. Checked:\n  {}'.format(
+                    '\n  '.join(checked_paths)
+                )
+            )
+
+        print('Using data list: {}'.format(fss_data_list_path))
         with open(fss_data_list_path, 'r') as f:
             f_str = f.readlines()
         data_list = []
         for line in f_str:
-            img, mask = line.split(' ')
+            line = line.strip()
+            if not line:
+                continue
+            img, mask = line.split(' ', 1)
             data_list.append((img, mask.strip()))
 
         # Start Processing
@@ -90,7 +130,7 @@ for sp in [0, 1, 2, 3]:
             #     else:
             #         pix[...] = sub_list.index(pix) + 1
             
-            save_item_path = osp.join(save_path, label_path.split('/')[-1])
+            save_item_path = osp.join(save_path, osp.basename(label_path))
             cv2.imwrite(save_item_path, label)
 
 

@@ -200,9 +200,9 @@ class OneModel(nn.Module):
 
         # ==================== 特征融合模块 ====================
         if self.shot==1:
-            channel = 514  # 1-shot时的通道数
+            channel = 516  # 1-shot时的通道数
         else:
-            channel = 514  # 多shot时的通道数
+            channel = 524  # 多shot时的通道数
         # 查询特征融合网络:将CNN特征、CLIP特征、原型等融合
         self.query_merge = nn.Sequential(
             nn.Conv2d(channel, 64, kernel_size=1, padding=0, bias=False),
@@ -286,76 +286,63 @@ class OneModel(nn.Module):
         # 按 shot 维度拆分为独立列表，便于逐样本处理
         supp_feat_list_ori = [supp_feat_item[:, i, ...] for i in range(self.shot)]
 
-        # # ==================== CLIP 特征提取 ====================
-        # # 对支持集图像应用掩膜，仅保留前景区域用于 CLIP 编码
-        # if mask is not None:
-        #     tmp_mask = F.interpolate(mask, size=x.shape[-2], mode='nearest')
-        #     s_x_mask = s_x * tmp_mask
-        # # 使用 CLIP 的 Vision Transformer 提取支持集和查询集的多层特征及注意力图
-        # tmp_supp_clip_fts, supp_attn_maps = self.clip_model.encode_image(s_x_mask, h, w, extract=True)[:]
-        # tmp_que_clip_fts, que_attn_maps = self.clip_model.encode_image(x, h, w, extract=True)[:]
+        # ==================== CLIP 特征提取 ====================
+        # 对支持集图像应用掩膜，仅保留前景区域用于 CLIP 编码
+        if mask is not None:
+            tmp_mask = F.interpolate(mask, size=x.shape[-2], mode='nearest')
+            s_x_mask = s_x * tmp_mask
+        # 使用 CLIP 的 Vision Transformer 提取支持集和查询集的多层特征及注意力图
+        tmp_supp_clip_fts, supp_attn_maps = self.clip_model.encode_image(s_x_mask, h, w, extract=True)[:]
+        tmp_que_clip_fts, que_attn_maps = self.clip_model.encode_image(x, h, w, extract=True)[:]
 
-        # # 移除 CLS token（索引 0），仅保留 patch token 用于密集预测
-        # supp_clip_fts = [ss[1:, :, :] for ss in tmp_supp_clip_fts]
-        # que_clip_fts = [ss[1:, :, :] for ss in tmp_que_clip_fts]
+        # 移除 CLS token（索引 0），仅保留 patch token 用于密集预测
+        supp_clip_fts = [ss[1:, :, :] for ss in tmp_supp_clip_fts]
+        que_clip_fts = [ss[1:, :, :] for ss in tmp_que_clip_fts]
 
-        # # 将特征从 [n_patches, bs, dim] 重排为 [bs, dim, n_patches]，再重塑为 2D 空间网格 [bs, dim, h, w]
-        # tmp_supp_clip_feat_all = [ss.permute(1, 2, 0) for ss in supp_clip_fts]
-        # supp_clip_feat_all = [aw.reshape(
-        #     tmp_supp_clip_feat_all[0].shape[0], tmp_supp_clip_feat_all[0].shape[1], int(math.sqrt(tmp_supp_clip_feat_all[0].shape[2])),
-        #     int(math.sqrt(tmp_supp_clip_feat_all[0].shape[2]))).float()
-        #     for aw in tmp_supp_clip_feat_all]
+        # 将特征从 [n_patches, bs, dim] 重排为 [bs, dim, n_patches]，再重塑为 2D 空间网格 [bs, dim, h, w]
+        tmp_supp_clip_feat_all = [ss.permute(1, 2, 0) for ss in supp_clip_fts]
+        supp_clip_feat_all = [aw.reshape(
+            tmp_supp_clip_feat_all[0].shape[0], tmp_supp_clip_feat_all[0].shape[1], int(math.sqrt(tmp_supp_clip_feat_all[0].shape[2])),
+            int(math.sqrt(tmp_supp_clip_feat_all[0].shape[2]))).float()
+            for aw in tmp_supp_clip_feat_all]
 
-        # tmp_que_clip_feat_all = [qq.permute(1, 2, 0) for qq in que_clip_fts]
-        # que_clip_feat_all = [aw.reshape(
-        #     tmp_que_clip_feat_all[0].shape[0], tmp_que_clip_feat_all[0].shape[1], int(math.sqrt(tmp_que_clip_feat_all[0].shape[2])),
-        #     int(math.sqrt(tmp_que_clip_feat_all[0].shape[2]))).float()
-        #     for aw in tmp_que_clip_feat_all]
+        tmp_que_clip_feat_all = [qq.permute(1, 2, 0) for qq in que_clip_fts]
+        que_clip_feat_all = [aw.reshape(
+            tmp_que_clip_feat_all[0].shape[0], tmp_que_clip_feat_all[0].shape[1], int(math.sqrt(tmp_que_clip_feat_all[0].shape[2])),
+            int(math.sqrt(tmp_que_clip_feat_all[0].shape[2]))).float()
+            for aw in tmp_que_clip_feat_all]
 
-        # # ==================== VVP: 视觉-视觉原型相似度 ====================
-        # # 利用 CLIP 深层特征（索引 10、11）计算查询集与支持集之间的视觉相似度图
-        # if self.shot == 1:
-        #     # 单样本设置：直接计算查询与支持的相似度
-        #     similarity2 = get_similarity(que_clip_feat_all[10], supp_clip_feat_all[10], s_y)
-        #     similarity1 = get_similarity(que_clip_feat_all[11], supp_clip_feat_all[11], s_y)
-        # else:
-        #     # 多样本设置：对每个 shot 分别计算相似度，然后沿通道拼接
-        #     mask = rearrange(mask, "(b n) c h w -> b n c h w", n=self.shot)
-        #     supp_clip_feat_all = [rearrange(ss, "(b n) c h w -> b n c h w", n=self.shot) for ss in supp_clip_feat_all]
-        #     clip_similarity_1 = [get_similarity(que_clip_feat_all[11], supp_clip_feat_all[11][:, i, ...], mask=mask[:, i, ...]) for i in
-        #                    range(self.shot)]
-        #     clip_similarity_2 = [get_similarity(que_clip_feat_all[10], supp_clip_feat_all[10][:, i, ...], mask=mask[:, i, ...]) for i in
-        #                    range(self.shot)]
-        #     mask = rearrange(mask, "b n c h w -> (b n) c h w")
-        #     similarity1 = torch.cat(clip_similarity_1, dim=1)
-        #     similarity2 = torch.cat(clip_similarity_2, dim=1)
-        # # 将两个层的相似度拼接，并上采样到 CNN 特征图的尺寸以进行融合
-        # clip_similarity = torch.cat([similarity1, similarity2], dim=1).cuda()
-        # clip_similarity = F.interpolate(clip_similarity, size=(supp_feat_cnn.shape[2], supp_feat_cnn.shape[3]), mode='bilinear', align_corners=True)
+        # ==================== VVP: 视觉-视觉原型相似度 ====================
+        # 利用 CLIP 深层特征（索引 10、11）计算查询集与支持集之间的视觉相似度图
         if self.shot == 1:
-            similarity1 = get_similarity(query_feat_5, supp_feat_5, mask)
-            similarity2 = get_similarity(query_feat_4, supp_feat_4, mask)
-            similarity = torch.cat([similarity1, similarity2], dim=1)
+            # 单样本设置：直接计算查询与支持的相似度
+            similarity2 = get_similarity(que_clip_feat_all[10], supp_clip_feat_all[10], s_y)
+            similarity1 = get_similarity(que_clip_feat_all[11], supp_clip_feat_all[11], s_y)
         else:
+            # 多样本设置：对每个 shot 分别计算相似度，然后沿通道拼接
             mask = rearrange(mask, "(b n) c h w -> b n c h w", n=self.shot)
-            supp_feat_5 = rearrange(supp_feat_5, "(b n) c h w -> b n c h w", n=self.shot)
-            supp_feat_4 = rearrange(supp_feat_4, "(b n) c h w -> b n c h w", n=self.shot)
-            clip_similarity_1 = [get_similarity(query_feat_5, supp_feat_5[:, i, ...], mask=mask[:, i, ...]) for i in range(self.shot)]
-            clip_similarity_2 = [get_similarity(query_feat_4, supp_feat_4[:, i, ...], mask=mask[:, i, ...]) for i in range(self.shot)]
+            supp_clip_feat_all = [rearrange(ss, "(b n) c h w -> b n c h w", n=self.shot) for ss in supp_clip_feat_all]
+            clip_similarity_1 = [get_similarity(que_clip_feat_all[11], supp_clip_feat_all[11][:, i, ...], mask=mask[:, i, ...]) for i in
+                           range(self.shot)]
+            clip_similarity_2 = [get_similarity(que_clip_feat_all[10], supp_clip_feat_all[10][:, i, ...], mask=mask[:, i, ...]) for i in
+                           range(self.shot)]
+            mask = rearrange(mask, "b n c h w -> (b n) c h w")
             similarity1 = torch.cat(clip_similarity_1, dim=1)
             similarity2 = torch.cat(clip_similarity_2, dim=1)
-            similarity = torch.cat([similarity1, similarity2], dim=1)
+        # 将两个层的相似度拼接，并上采样到 CNN 特征图的尺寸以进行融合
+        clip_similarity = torch.cat([similarity1, similarity2], dim=1).cuda()
+        clip_similarity = F.interpolate(clip_similarity, size=(supp_feat_cnn.shape[2], supp_feat_cnn.shape[3]), mode='bilinear', align_corners=True)
 
-        # # ==================== VTP: 视觉-文本原型 CAM ====================
-        # # 使用 GradCAM 基于 CLIP 文本特征（前景/背景描述）生成类别激活图
-        # target_layers = [self.clip_model.visual.transformer.resblocks[-1].ln_1]
-        # cam = GradCAM(model=self.clip_model, target_layers=target_layers, reshape_transform=reshape_transform)
-        # img_cam_list = get_img_cam(x_cv2, que_name, class_name, self.clip_model, self.bg_text_features, self.fg_text_features, cam, self.annotation_root, self.training)
-        # # 将 CAM 上采样到与 CNN 特征图一致的尺寸
-        # img_cam_list = [F.interpolate(t_img_cam.unsqueeze(0).unsqueeze(0), size=(supp_feat_cnn.shape[2], supp_feat_cnn.shape[3]), mode='bilinear',
-        #                               align_corners=True) for t_img_cam in img_cam_list]
-        # img_cam = torch.cat(img_cam_list, 0)
-        # img_cam = img_cam.repeat(1,2,1,1)
+        # ==================== VTP: 视觉-文本原型 CAM ====================
+        # 使用 GradCAM 基于 CLIP 文本特征（前景/背景描述）生成类别激活图
+        target_layers = [self.clip_model.visual.transformer.resblocks[-1].ln_1]
+        cam = GradCAM(model=self.clip_model, target_layers=target_layers, reshape_transform=reshape_transform)
+        img_cam_list = get_img_cam(x_cv2, que_name, class_name, self.clip_model, self.bg_text_features, self.fg_text_features, cam, self.annotation_root, self.training)
+        # 将 CAM 上采样到与 CNN 特征图一致的尺寸
+        img_cam_list = [F.interpolate(t_img_cam.unsqueeze(0).unsqueeze(0), size=(supp_feat_cnn.shape[2], supp_feat_cnn.shape[3]), mode='bilinear',
+                                      align_corners=True) for t_img_cam in img_cam_list]
+        img_cam = torch.cat(img_cam_list, 0)
+        img_cam = img_cam.repeat(1,2,1,1)
 
         # ==================== 支持集特征处理 ====================
         # 对支持集 CNN 特征进行加权全局平均池化（以 mask 为权重），得到原型向量
@@ -398,11 +385,11 @@ class OneModel(nn.Module):
         supp_feat_bin = rearrange(supp_feat_bin, "(b n) c h w -> b n c h w", n=self.shot)
         supp_feat_bin = torch.mean(supp_feat_bin, dim=1)
         # 拼接查询特征、支持原型、CAM 和 VVP 相似度，送入 query_merge 融合
-        query_feat = self.query_merge(torch.cat([query_feat_cnn, supp_feat_bin, similarity * 10], dim=1))
+        query_feat = self.query_merge(torch.cat([query_feat_cnn, supp_feat_bin, img_cam * 10, clip_similarity * 10], dim=1))
 
         # ==================== Transformer 解码 & 基类分类器 ====================
         # 通过交叉注意力 Transformer 生成元学习的预测结果及中间注意力权重
-        meta_out, weights = self.transformer(query_feat, supp_feat, mask, similarity)
+        meta_out, weights = self.transformer(query_feat, supp_feat, mask, img_cam, clip_similarity)
         # 基类分类器使用最高层 CNN 特征预测基类概率
         base_out = self.base_learnear(query_feat_5)
 
@@ -532,4 +519,3 @@ class OneModel(nn.Module):
             feat = self.cls(feat)
             results.append(feat)
         return results
-    

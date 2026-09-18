@@ -196,7 +196,7 @@ class MixVisionTransformer(BaseModule):
         super(MixVisionTransformer, self).__init__(init_cfg=init_cfg)
         self.shot = shot
 
-        # -------------------------------------------------------- Self Attention for Down Sample ------------------------------------------------------------
+        # Self Attention for Down Sample
         self.num_similarity_channels = num_similarity_channels
         self.num_down_stages = num_down_stages
         self.embed_dims = embed_dims
@@ -241,12 +241,9 @@ class MixVisionTransformer(BaseModule):
                 build_norm_layer(norm_cfg, embed_dims)[1]
             ]))
 
-        # -------------------------------------------------------- Corss Attention for Down Matching ------------------------------------------------------------
+        # Corss Attention for Down Matching
         self.match_layers = ModuleList()
-        if self.shot == 1:
-            conv_channel = self.match_dims + 2 * self.num_similarity_channels
-        else:
-            conv_channel = self.match_dims + 2 * self.num_similarity_channels + 8
+        conv_channel = self.match_dims + self.num_similarity_channels
         for i in range(self.num_down_stages):
             level_match_layers = ModuleList([
                 TransformerEncoderLayer(
@@ -299,13 +296,13 @@ class MixVisionTransformer(BaseModule):
         else:
             super(MixVisionTransformer, self).init_weights()
 
-    def forward(self, q_x, s_x, mask, similarity, ori_similarity):
+    def forward(self, q_x, s_x, mask, similarity):
         down_query_features = []
         down_support_features = []
         hw_shapes = []
         down_masks = []
         down_similarity = []
-        down_similarity_ori = []
+        # down_similarity_ori = []
         weights = []
         for i, layer in enumerate(self.down_sample_layers):
             q_x, q_hw_shape = layer[0](q_x)
@@ -317,13 +314,13 @@ class MixVisionTransformer(BaseModule):
             tmp_mask = rearrange(tmp_mask, "(b n) 1 h w -> b 1 (n h w)", n=self.shot)
             tmp_mask = tmp_mask.repeat(1, q_hw_shape[0] * q_hw_shape[1], 1)
             tmp_similarity = resize(similarity, q_hw_shape, mode="bilinear", align_corners=True)
-            tmp_ori_similarity = resize(ori_similarity, q_hw_shape, mode="bilinear", align_corners=True)
+            # tmp_ori_similarity = resize(ori_similarity, q_hw_shape, mode="bilinear", align_corners=True)
             down_query_features.append(q_x)     # intermediate feature maps
             down_support_features.append(rearrange(s_x, "(b n) l c -> b (n l) c", n=self.shot))  # intermediate feature maps
             hw_shapes.append(q_hw_shape)
             down_masks.append(tmp_mask)
             down_similarity.append(tmp_similarity)
-            down_similarity_ori.append(tmp_ori_similarity)
+            # down_similarity_ori.append(tmp_ori_similarity)
             if i != self.num_down_stages - 1:
                 q_x, s_x = nlc_to_nchw(q_x, q_hw_shape), nlc_to_nchw(s_x, s_hw_shape)
 
@@ -338,7 +335,7 @@ class MixVisionTransformer(BaseModule):
                 cross=True)
             out = nlc_to_nchw(out, hw_shapes[i])
             weight = weight.view(out.shape[0], hw_shapes[i][0], hw_shapes[i][1])
-            out = layer[1](torch.cat([out, down_similarity[i], down_similarity_ori[i]], dim=1))
+            out = layer[1](torch.cat([out, down_similarity[i]], dim=1))
             weights.append(weight)
             # print(layer_out.shape)
             if outs is None:
@@ -356,7 +353,6 @@ class Transformer(nn.Module):
         self.shot = shot
         self.mix_transformer = MixVisionTransformer(shot=self.shot)
 
-    def forward(self, features, supp_features, mask, similaryty, ori_similarity):
-        shape = features.shape[-2:]
-        outs, weights = self.mix_transformer(features, supp_features, mask, similaryty, ori_similarity)
+    def forward(self, features, supp_features, mask, similarity):
+        outs, weights = self.mix_transformer(features, supp_features, mask, similarity)
         return outs, weights
