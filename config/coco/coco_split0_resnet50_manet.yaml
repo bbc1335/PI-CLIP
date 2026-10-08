@@ -61,10 +61,11 @@ Method:
   aux_weight2: 1.0
   low_fea: 'layer2'  # low_fea for computing the Gram matrix
   kshot_trans_dim: 2 # K-shot dimensionality reduction
+  use_text_visual_pyramid: False
+  use_mi_cocluster_vvp: False
   merge: 'final'     # fusion scheme for GFSS ('base' Eq(S1) | 'final' Eq(18) )
   merge_tau: 0.9     # fusion threshold tau
 
 Test_Finetune:
   weight: # Path to the test model
   ann_type: 'mask' 
-

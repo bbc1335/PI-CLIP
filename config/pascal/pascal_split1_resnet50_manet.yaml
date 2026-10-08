@@ -21,14 +21,14 @@ Train:
   ignore_label: 255
   padding_label: 255
   # Dataset & Mode
-  split: 0
+  split: 1
   shot: 1
   data_set: 'pascal'
   use_split_coco: False # True means FWB setting
   # Optimizer
   batch_size: 8 # batch size for training (bs8 for 1GPU)
   base_lr: 0.0001 
-  pre_weight: ./initmodel/PSPNet/pascal/split0/resnet50/best.pth
+  pre_weight: ./initmodel/PSPNet/pascal/split1/resnet50/best.pth
   epochs: 200
   start_epoch: 0 
   stop_interval: 80 # stop when the best result is not updated for "stop_interval" epochs

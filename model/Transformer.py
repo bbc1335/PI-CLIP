@@ -302,7 +302,6 @@ class MixVisionTransformer(BaseModule):
         hw_shapes = []
         down_masks = []
         down_similarity = []
-        # down_similarity_ori = []
         weights = []
         for i, layer in enumerate(self.down_sample_layers):
             q_x, q_hw_shape = layer[0](q_x)
@@ -314,13 +313,11 @@ class MixVisionTransformer(BaseModule):
             tmp_mask = rearrange(tmp_mask, "(b n) 1 h w -> b 1 (n h w)", n=self.shot)
             tmp_mask = tmp_mask.repeat(1, q_hw_shape[0] * q_hw_shape[1], 1)
             tmp_similarity = resize(similarity, q_hw_shape, mode="bilinear", align_corners=True)
-            # tmp_ori_similarity = resize(ori_similarity, q_hw_shape, mode="bilinear", align_corners=True)
             down_query_features.append(q_x)     # intermediate feature maps
             down_support_features.append(rearrange(s_x, "(b n) l c -> b (n l) c", n=self.shot))  # intermediate feature maps
             hw_shapes.append(q_hw_shape)
             down_masks.append(tmp_mask)
             down_similarity.append(tmp_similarity)
-            # down_similarity_ori.append(tmp_ori_similarity)
             if i != self.num_down_stages - 1:
                 q_x, s_x = nlc_to_nchw(q_x, q_hw_shape), nlc_to_nchw(s_x, s_hw_shape)
 

@@ -3,12 +3,37 @@ class_names = ['aeroplane', 'bicycle', 'bird', 'boat', 'bottle',
                    'diningtable', 'dog', 'horse', 'motorbike', 'person',
                    'pottedplant', 'sheep', 'sofa', 'train', 'tvmonitor',
                    ]
-                   
-new_class_names = ['aeroplane', 'bicycle', 'bird avian', 'boat', 'bottle',
-                   'bus', 'car', 'cat', 'chair seat', 'cow',
-                   'diningtable', 'dog', 'horse', 'motorbike', 'person with clothes,people,human',
-                   'pottedplant', 'sheep', 'sofa', 'train', 'tvmonitor screen',
-                   ]
+
+
+# new_class_names = ['aeroplane', 'bicycle', 'bird avian', 'boat', 'bottle',
+#                    'bus', 'car', 'cat', 'chair seat', 'cow',
+#                    'diningtable', 'dog', 'horse', 'motorbike', 'person with clothes,people,human',
+#                    'pottedplant', 'sheep', 'sofa', 'train', 'tvmonitor screen',
+#                    ]
+
+
+new_class_names = [
+    'aeroplane,airplane',
+    'bicycle,bike',
+    'bird,avian',
+    'boat',
+    'bottle',
+    'bus',
+    'car',
+    'cat',
+    'chair,seat',
+    'cow',
+    'diningtable,dining table',
+    'dog',
+    'horse',
+    'motorbike,motorcycle',
+    'person with clothes,people,human',
+    'pottedplant,potted plant',
+    'sheep',
+    'sofa',
+    'train',
+    'tvmonitor,television monitor,tv screen',
+]
 
 
 class_names_coco = ['person','bicycle','car','motorbike','aeroplane',

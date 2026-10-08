@@ -5,4 +5,5 @@
 *.pt
 *.json
 *.pdf
-
+*.log
+*.md

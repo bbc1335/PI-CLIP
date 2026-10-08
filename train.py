@@ -1,6 +1,7 @@
 import os
 import datetime
 import time
+import logging
 import cv2
 import numpy as np
 import argparse
@@ -60,7 +61,7 @@ def get_model(args):
     if args.distributed:
         # Initialize Process Group
         dist.init_process_group(backend='nccl')
-        print('args.local_rank: ', args.local_rank)
+        logger.info('args.local_rank: %s', args.local_rank)
         torch.cuda.set_device(args.local_rank)
         device = torch.device('cuda', args.local_rank)
         model.to(device)
@@ -82,6 +83,13 @@ def get_model(args):
             checkpoint = torch.load(resume_path, map_location=torch.device('cpu'))
             args.start_epoch = checkpoint['epoch']
             new_param = checkpoint['state_dict']
+            # CLIP 前向会动态生成这个位置编码缓存，旧检查点中可能包含它，
+            # 但当前模型不把它注册为参数，加载前移除以兼容旧权重。
+            new_param.pop('clip_model.visual.positional_embedding_new', None)
+            new_param.pop(
+                'module.clip_model.visual.positional_embedding_new',
+                None,
+            )
             try:
                 model.load_state_dict(new_param)
             except RuntimeError:  # 1GPU loads mGPU model
@@ -98,8 +106,8 @@ def get_model(args):
     # Get model para.
     total_number, learnable_number = get_model_para_number(model)
     if main_process():
-        print('Number of Parameters: %d' % (total_number))
-        print('Number of Learnable Parameters: %d' % (learnable_number))
+        logger.info('Number of Parameters: %d', total_number)
+        logger.info('Number of Learnable Parameters: %d', learnable_number)
 
     time.sleep(5)
     return model, optimizer
@@ -124,10 +132,14 @@ def main():
     
     # ==================== 初始化配置 ====================
     args = get_parser()  # 解析命令行参数和配置文件
-    logger = get_logger()  # 初始化日志记录器
     args.distributed = True if torch.cuda.device_count() > 1 else False  # 根据GPU数量判断是否使用分布式训练
+    get_save_path(args)
+    check_makedirs(args.result_path)
+    log_file = osp.join(args.result_path, 'train.log') if main_process() else None
+    logger = get_logger(log_file=log_file)  # 终端和主进程日志文件同时输出
     if main_process():
-        print(args)  # 打印配置参数（仅在主进程）
+        logger.info('Log file: %s', log_file)
+        logger.info('Training config:\n%s', args)  # 记录配置参数（仅在主进程）
 
     # 设置随机种子以保证实验可重复性
     if args.manual_seed is not None:
@@ -308,14 +320,14 @@ def main():
     total_time = '{:02d}h {:02d}m {:02d}s'.format(int(t_h), int(t_m), int(t_s))
 
     if main_process():
-        print('\nEpoch: {}/{} \t Total running time: {}'.format(epoch_log, args.epochs, total_time))
-        print('The number of models validated: {}'.format(val_num))
-        print('\n<<<<<<<<<<<<<<<<<<<<<<<<<<<<<  Final Best Result   <<<<<<<<<<<<<<<<<<<<<<<<<<<<<')
-        print(args.arch + '\t Group:{} \t Best_step:{}'.format(args.split, best_epoch))
-        print('mIoU:{:.4f} \t mIoU_m:{:.4f} \t mIoU_b:{:.4f}'.format(best_miou, best_miou_m, best_miou_b))
-        print('FBIoU:{:.4f} \t FBIoU_m:{:.4f} \t pIoU:{:.4f}'.format(best_FBiou, best_FBiou_m, best_piou))
-        print('>' * 80)
-        print('%s' % datetime.datetime.now())
+        logger.info('\nEpoch: {}/{} \t Total running time: {}'.format(epoch_log, args.epochs, total_time))
+        logger.info('The number of models validated: {}'.format(val_num))
+        logger.info('\n<<<<<<<<<<<<<<<<<<<<<<<<<<<<<  Final Best Result   <<<<<<<<<<<<<<<<<<<<<<<<<<<<<')
+        logger.info(args.arch + '\t Group:{} \t Best_step:{}'.format(args.split, best_epoch))
+        logger.info('mIoU:{:.4f} \t mIoU_m:{:.4f} \t mIoU_b:{:.4f}'.format(best_miou, best_miou_m, best_miou_b))
+        logger.info('FBIoU:{:.4f} \t FBIoU_m:{:.4f} \t pIoU:{:.4f}'.format(best_FBiou, best_FBiou_m, best_piou))
+        logger.info('>' * 80)
+        logger.info('%s' % datetime.datetime.now())
 
 
 def train(train_loader, val_loader, model, optimizer, epoch):
@@ -358,7 +370,7 @@ def train(train_loader, val_loader, model, optimizer, epoch):
     val_time = 0.  # 验证过程耗时
     max_iter = args.epochs * len(train_loader)  # 计算最大迭代次数
     if main_process():
-        print('Warmup: {}'.format(args.warmup))  # 打印学习率预热信息
+        logger.info('Warmup: {}'.format(args.warmup))  # 记录学习率预热信息
 
     # 遍历训练数据加载器，i为批次索引
     for i, (input, input_name, target, target_b, s_input, s_mask, subcls, class_name, img_cv2) in enumerate(train_loader):
@@ -612,7 +624,7 @@ def validate(val_loader, model):
             loss_meter.update(loss.item(), input.size(0))
             batch_time.update(time.time() - end)
             end = time.time()
-            if ((i + 1) % round((test_num / 100)) == 0) and main_process():
+            if ((i + 1) % round((test_num / 2)) == 0) and main_process():
                 logger.info('Test: [{}/{}] '
                             'Data {data_time.val:.3f} ({data_time.avg:.3f}) '
                             'Batch {batch_time.val:.3f} ({batch_time.avg:.3f}) '
@@ -677,7 +689,8 @@ def validate(val_loader, model):
             logger.info('Class_{} Result: iou_m {:.4f}.'.format(i, iou_class_m[i]))
         logger.info('<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<')
 
-        print('total time: {:.4f}, avg inference time: {:.4f}, count: {}'.format(val_time, model_time.avg, test_num))
+        logger.info('total time: {:.4f}, avg inference time: {:.4f}, count: {}'.format(
+            val_time, model_time.avg, test_num))
 
     return loss_meter.avg, mIoU, mIoU_m, class_miou, class_miou_m, class_miou_b, iou_class[1]
 
@@ -697,4 +710,8 @@ def map_to_square(x):
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except Exception:
+        logging.getLogger("main-logger").exception("Training failed")
+        raise

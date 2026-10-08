@@ -215,14 +215,40 @@ def setup_seed(seed=2021, deterministic=False):
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
     
-def get_logger():
+def get_logger(log_file=None):
     logger_name = "main-logger"
-    logger = logging.getLogger()
+    logger = logging.getLogger(logger_name)
     logger.setLevel(logging.INFO)
-    handler = logging.StreamHandler()
+    logger.propagate = False
+
     fmt = "[%(asctime)s %(levelname)s %(filename)s line %(lineno)d %(process)d] %(message)s"
-    handler.setFormatter(logging.Formatter(fmt))
-    logger.addHandler(handler)
+    formatter = logging.Formatter(fmt)
+
+    has_stream_handler = any(
+        getattr(handler, "_pi_clip_stream_handler", False) for handler in logger.handlers
+    )
+    if not has_stream_handler:
+        handler = logging.StreamHandler()
+        handler.setFormatter(formatter)
+        handler._pi_clip_stream_handler = True
+        logger.addHandler(handler)
+
+    if log_file is not None:
+        log_file = os.path.abspath(log_file)
+        log_dir = os.path.dirname(log_file)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+
+        has_file_handler = any(
+            getattr(handler, "_pi_clip_log_file", None) == log_file
+            for handler in logger.handlers
+        )
+        if not has_file_handler:
+            file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
+            file_handler.setFormatter(formatter)
+            file_handler._pi_clip_log_file = log_file
+            logger.addHandler(file_handler)
+
     return logger
 
 def get_save_path(args):

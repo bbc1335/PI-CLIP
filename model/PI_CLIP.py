@@ -13,15 +13,101 @@ from model.get_cam import get_img_cam
 from pytorch_grad_cam import GradCAM
 from clip.clip_text import new_class_names, new_class_names_coco
 
+# ============================================================================
+# [既有方案 D 纯净版接口开始] 多粒度文本-视觉相似度金字塔
+# 核心实现全部位于 model/text_visual_pyramid_pure.py。本文件只负责：
+#   1. 复用原 forward 已经提取的 query CLIP 多层特征；
+#   2. 复用初始化阶段已经缓存的 foreground/background 文本特征；
+#   3. 将固定先验图作为一个额外通道接入原分割流程。
+# ============================================================================
+from model.text_visual_pyramid_pure import (
+    CLIP_LAYER_IDS,
+    TextVisualSimilarityPyramidPure,
+)
+
+# ============================================================================
+# [MI-CoCluster VVP 新接口开始]
+# 核心实现全部位于 model/mi_cocluster_vvp.py。该接口根据配置用 MI-CoCluster
+# VVP 替换原 CNN stage-4/5 VVP，不改变文本-视觉先验分支和旧权重协议。
+# ============================================================================
+from model.mi_cocluster_vvp import MICoClusterVVP
+# ============================================================================
+# [既有方案 D 与 MI-CoCluster VVP 接口结束]
+# ============================================================================
+
+
+def _flatten_integer_values(value):
+    """[方案 D 新增] 将 class_name 或 cat_idx 中的类别索引统一展平。"""
+    if value is None:
+        return []
+    if torch.is_tensor(value):
+        if value.numel() == 0:
+            return []
+        return [int(item) for item in value.detach().cpu().reshape(-1).tolist()]
+    if isinstance(value, (list, tuple)):
+        flattened = []
+        for item in value:
+            flattened.extend(_flatten_integer_values(item))
+        return flattened
+    try:
+        return [int(value)]
+    except (TypeError, ValueError):
+        return []
+
+def _split_classname_synonyms(classname):
+    """将类别名中的逗号同义词拆成独立自然短语。
+
+    例如：
+        "person with clothes,people,human"
+    会变成：
+        ["person with clothes", "people", "human"]
+
+    没有逗号的普通类别名仍然返回单元素列表，因此不会改变原有类别行为。
+    """
+    if not isinstance(classname, str):
+        return [classname]
+    variants = [item.strip() for item in classname.split(',') if item.strip()]
+    return variants if variants else [classname]
+
+
+# 通用背景模板只扩展背景提示，不改变前景模板。
+# 多个背景模板的文本特征会在 zeroshot_classifier 中先归一化、再平均，
+# 最终仍然得到一个 [num_classes, text_dim] 的背景特征矩阵。
+GENERIC_BACKGROUND_TEMPLATES = [
+    'a photo without {}.',
+    'a background scene without {}.',
+    'a scene with no {}.',
+]
+
+
 def zeroshot_classifier(classnames, templates, model):
+    """生成类别文本特征。
+
+    参数：
+        classnames:
+            类别名称列表。函数会固定将逗号分隔的同义词拆成多个自然提示。
+        templates:
+            提示模板列表。
+        model:
+            CLIP 文本编码器。
+    """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     with torch.no_grad():
         zeroshot_weights = []
         for classname in classnames:
-            texts = [template.format(classname) for template in templates] #format with class
+            # 同义词分开生成文本，避免把多个词拼成不自然的
+            # "person with clothes,people,human" 长句子。
+            classname_variants = _split_classname_synonyms(classname)
+            texts = [
+                template.format(classname_variant)
+                for classname_variant in classname_variants
+                for template in templates
+            ]
             texts = clip.tokenize(texts).to(device) #tokenize
             class_embeddings = model.encode_text(texts) #embed with text encoder
             class_embeddings /= class_embeddings.norm(dim=-1, keepdim=True)
+            # 对同义词和背景模板的 embedding 做平均，再重新归一化。
+            # 这样输出形状仍是 [1, text_dim]，下游 VTP 接口不需要修改。
             class_embedding = class_embeddings.mean(dim=0)
             class_embedding /= class_embedding.norm()
             zeroshot_weights.append(class_embedding)
@@ -159,6 +245,22 @@ class OneModel(nn.Module):
         from torch.nn import BatchNorm2d as BatchNorm
         self.criterion = nn.CrossEntropyLoss(ignore_index=args.ignore_label)  # 损失函数
         self.shot = args.shot  # 少样本的样本数量(1-shot, 5-shot等)
+
+        # [方案 D 纯净版接口] 原来的 VVP 相似度通道保持不变；启用先验时，
+        # query_merge 额外接收文本视觉先验通道，Transformer 仍只使用 VVP。
+        self.use_text_visual_pyramid = bool(
+            getattr(args, "use_text_visual_pyramid", False)
+        )
+        # [MI-CoCluster VVP 接口] 新方法只替换原 VVP 的相似度来源，
+        # 不改变文本视觉先验和 Transformer 的通道协议。默认关闭，
+        # 因此不修改配置时仍可复现原来的训练行为。
+        self.use_mi_cocluster_vvp = bool(
+            getattr(args, "use_mi_cocluster_vvp", False)
+        )
+        self.visual_similarity_channels = self.shot * 2
+        self.similarity_channels = self.visual_similarity_channels + int(
+            self.use_text_visual_pyramid
+        )
         self.vgg = args.vgg  # 是否使用VGG backbone
         models.BatchNorm = BatchNorm
 
@@ -199,10 +301,7 @@ class OneModel(nn.Module):
         )
 
         # ==================== 特征融合模块 ====================
-        if self.shot==1:
-            channel = 514  # 1-shot时的通道数
-        else:
-            channel = 514  # 多shot时的通道数
+        channel = 512 + self.similarity_channels
         # 查询特征融合网络:将CNN特征、CLIP特征、原型等融合
         self.query_merge = nn.Sequential(
             nn.Conv2d(channel, 64, kernel_size=1, padding=0, bias=False),
@@ -244,20 +343,243 @@ class OneModel(nn.Module):
         self.annotation_root = args.annotation_root  # 标注根目录
         self.clip_model, _ = clip.load(args.clip_path)  # 加载预训练CLIP模型
         
-        # 预计算文本特征(零样本分类器)
+        # 预计算文本特征（零样本分类器）。
+        # 同义词拆分和多背景模板固定启用，作为文本提示增强方法的一部分，
+        # 不再暴露为独立消融开关。
+        background_templates = GENERIC_BACKGROUND_TEMPLATES
         if self.dataset == 'pascal':
-            # PASCAL数据集的背景文本特征("a photo without {xxx}")
-            self.bg_text_features = zeroshot_classifier(new_class_names, ['a photo without {}.'],
-                                                        self.clip_model)
-            # PASCAL数据集的前景文本特征("a photo of {xxx}")
-            self.fg_text_features = zeroshot_classifier(new_class_names, ['a photo of {}.'],
-                                                        self.clip_model)
+            # PASCAL 背景文本特征：
+            # 同义词拆成自然短语，并加入多个通用背景模板。
+            self.bg_text_features = zeroshot_classifier(
+                new_class_names,
+                background_templates,
+                self.clip_model,
+            )
+            # PASCAL 前景文本特征：同义词拆成自然短语。
+            self.fg_text_features = zeroshot_classifier(
+                new_class_names,
+                ['a photo of {}.'],
+                self.clip_model,
+            )
         elif self.dataset == 'coco':
-            # COCO数据集的文本特征
-            self.bg_text_features = zeroshot_classifier(new_class_names_coco, ['a photo without {}.'],
-                                                        self.clip_model)
-            self.fg_text_features = zeroshot_classifier(new_class_names_coco, ['a photo of {}.'],
-                                                        self.clip_model)
+            # COCO 背景文本特征：
+            # 同义词拆成自然短语，并加入多个通用背景模板。
+            self.bg_text_features = zeroshot_classifier(
+                new_class_names_coco,
+                background_templates,
+                self.clip_model,
+            )
+            # COCO 前景文本特征：同义词拆成自然短语。
+            self.fg_text_features = zeroshot_classifier(
+                new_class_names_coco,
+                ['a photo of {}.'],
+                self.clip_model,
+            )
+
+        # ====================================================================
+        # [方案 D 纯净版接口] 创建固定文本-视觉金字塔，并复用上面已经
+        # 计算好的 fg_text_features / bg_text_features。该模块没有可训练
+        # 参数，文本投影和融合卷积在初始化后都保持冻结。
+        # ====================================================================
+        self.text_visual_pyramid = None
+        if self.use_text_visual_pyramid:
+            visual_proj = getattr(self.clip_model.visual, "proj", None)
+            if visual_proj is None:
+                raise RuntimeError(
+                    "TextVisualSimilarityPyramidPure requires a CLIP ViT "
+                    "visual projection layer."
+                )
+            projection_init = torch.linalg.pinv(
+                visual_proj.detach().float()
+            ).t().contiguous()
+            self.text_visual_pyramid = TextVisualSimilarityPyramidPure(
+                vision_dim=visual_proj.shape[0],
+                text_dim=self.fg_text_features.shape[-1],
+                projection_init=projection_init,
+            )
+        # ====================================================================
+        # [MI-CoCluster VVP 接口] 使用 CLIP 第 9、10 层 patch 特征生成
+        # 新的 VVP 相似度图。默认关闭可学习融合时保持固定的 0.5C + 0.5U，
+        # 不新增可训练参数；开启后两层各有一个可学习 logit（存放在长度为 2
+        # 的参数中），用于学习凸组合。
+        # ====================================================================
+        self.mi_cocluster_vvp = None
+        if self.use_mi_cocluster_vvp:
+            self.mi_cocluster_vvp = MICoClusterVVP(
+                shot=self.shot,
+                rank=16,
+                num_iters=4,
+                use_learnable_fusion=args.use_learnable_fusion,
+            )
+        # ====================================================================
+        # [方案 D 纯净版接口结束]
+        # ====================================================================
+
+    @staticmethod
+    def _reshape_clip_feature_layers(
+        clip_feature_layers,
+        image_h,
+        image_w,
+        patch_size=16,
+    ):
+        """[MI-CoCluster VVP 新增] 将 CLIP 多层 token 转成空间特征图。
+
+        CLIP 的 ``extract=True`` 返回的每一层特征形状为
+        ``[N_patch + 1, B, C]``，其中第 0 个 token 是 [CLS]。新 VVP
+        只需要 patch token，因此先去掉 [CLS]，再恢复为 ``[B, C, H, W]``。
+        """
+        patch_tokens = [
+            layer[1:, :, :] for layer in clip_feature_layers
+        ]
+        grid_h = int(image_h) // int(patch_size)
+        grid_w = int(image_w) // int(patch_size)
+        num_patches = grid_h * grid_w
+
+        feature_maps = []
+        for layer in patch_tokens:
+            # [N_patch, B, C] -> [B, C, N_patch]
+            layer = layer.permute(1, 2, 0)
+            if layer.shape[-1] != num_patches:
+                raise ValueError(
+                    "CLIP patch token number does not match the input "
+                    f"grid: got {layer.shape[-1]}, expected {num_patches}."
+                )
+            feature_maps.append(
+                layer.reshape(
+                    layer.shape[0],
+                    layer.shape[1],
+                    grid_h,
+                    grid_w,
+                ).float()
+            )
+        return feature_maps
+
+    def _build_cnn_vvp(
+        self,
+        query_feat_4,
+        query_feat_5,
+        supp_feat_4,
+        supp_feat_5,
+        mask,
+    ):
+        """[MI-CoCluster VVP 对比接口] 复用原 CNN stage-4/5 VVP。
+
+        1-shot 时输出 [B, 2, H, W]，K-shot 时输出 [B, 2*K, H, W]。
+        输出通道协议与 MI-CoCluster VVP 完全一致，可用于统一接口。
+        """
+        if self.shot == 1:
+            similarity1 = get_similarity(query_feat_5, supp_feat_5, mask)
+            similarity2 = get_similarity(query_feat_4, supp_feat_4, mask)
+            return torch.cat([similarity1, similarity2], dim=1)
+
+        mask = rearrange(mask, "(b n) c h w -> b n c h w", n=self.shot)
+        supp_feat_5 = rearrange(
+            supp_feat_5, "(b n) c h w -> b n c h w", n=self.shot
+        )
+        supp_feat_4 = rearrange(
+            supp_feat_4, "(b n) c h w -> b n c h w", n=self.shot
+        )
+        clip_similarity_1 = [
+            get_similarity(
+                query_feat_5,
+                supp_feat_5[:, i, ...],
+                mask=mask[:, i, ...],
+            )
+            for i in range(self.shot)
+        ]
+        clip_similarity_2 = [
+            get_similarity(
+                query_feat_4,
+                supp_feat_4[:, i, ...],
+                mask=mask[:, i, ...],
+            )
+            for i in range(self.shot)
+        ]
+        similarity1 = torch.cat(clip_similarity_1, dim=1)
+        similarity2 = torch.cat(clip_similarity_2, dim=1)
+        return torch.cat([similarity1, similarity2], dim=1)
+
+    def _resolve_class_indices(self, class_name, cat_idx, batch_size, device):
+        """[方案 D 新增] 解析当前 batch 每个查询图像对应的类别文本索引。"""
+        indices = _flatten_integer_values(class_name)
+        if not indices:
+            indices = _flatten_integer_values(cat_idx)
+        if not indices:
+            raise ValueError(
+                "Unable to resolve a class index from class_name or cat_idx."
+            )
+
+        if len(indices) == 1:
+            resolved = indices * batch_size
+        elif len(indices) == batch_size:
+            resolved = indices
+        elif len(indices) % batch_size == 0:
+            stride = len(indices) // batch_size
+            resolved = indices[::stride]
+        else:
+            raise ValueError(
+                f"Received {len(indices)} class indices for batch size "
+                f"{batch_size}."
+            )
+
+        num_classes = self.fg_text_features.shape[0]
+        if any(index < 0 or index >= num_classes for index in resolved):
+            raise IndexError(
+                f"Class indices must be in [0, {num_classes}), got {resolved}."
+            )
+        return torch.tensor(resolved, dtype=torch.long, device=device)
+
+    def _build_text_visual_prior(
+        self,
+        query_clip_feature_layers,
+        class_name,
+        cat_idx,
+        output_size,
+    ):
+        """[方案 D 纯净版] 复用 query CLIP 特征生成文本视觉先验图。"""
+        if self.text_visual_pyramid is None:
+            raise RuntimeError(
+                "TextVisualSimilarityPyramidPure is not enabled."
+            )
+
+        if len(query_clip_feature_layers) <= max(CLIP_LAYER_IDS):
+            raise ValueError(
+                "query_clip_feature_layers does not contain all layers "
+                f"required by scheme D: {CLIP_LAYER_IDS}."
+            )
+
+        # 原始 CLIP 特征列表包含全部 12 层，当前方案 D 选择人工编号
+        # 第 10、11、12 层（零基索引 9、10、11）。
+        query_pyramid = tuple(
+            query_clip_feature_layers[layer_id] for layer_id in CLIP_LAYER_IDS
+        )
+
+        batch_size = query_pyramid[0].shape[0]
+        class_indices = self._resolve_class_indices(
+            class_name,
+            cat_idx,
+            batch_size,
+            query_pyramid[0].device,
+        )
+        fg_text_features = self.fg_text_features.to(
+            query_pyramid[0].device
+        ).index_select(0, class_indices)
+        bg_text_features = self.bg_text_features.to(
+            query_pyramid[0].device
+        ).index_select(
+            0,
+            class_indices,
+        )
+
+        # 文本特征沿用原模型初始化阶段已有的 fg/bg_text_features，不重新
+        # 运行文本编码器。
+        # 金字塔模块输出 [B, 1, H, W] 的前景先验图。
+        return self.text_visual_pyramid(
+            query_pyramid,
+            fg_text_features,
+            bg_text_features,
+            output_size=output_size,
+        )
 
     def forward(self, x, x_cv2, que_name, class_name, y_m=None, y_b=None, s_x=None, s_y=None, cat_idx=None):
         # ==================== 输入预处理 ====================
@@ -269,10 +591,9 @@ class OneModel(nn.Module):
         s_x = rearrange(s_x, "b n c h w -> (b n) c h w")
 
         # ==================== CNN 特征提取 ====================
-        # 提取查询图像的 CNN 多尺度特征（仅使用 stage 2~5）
+        # 提取查询图像和支持图像的 CNN 多尺度特征（仅使用 stage 2~5）
         _, _, query_feat_2, query_feat_3, query_feat_4, query_feat_5 = self.extract_feats(x)
-        # 提取支持集图像的 CNN 多尺度特征，通过 mask 进行前景掩蔽
-        supp_feat_0, supp_feat_1, supp_feat_2, supp_feat_3, supp_feat_4, supp_feat_5 = self.extract_feats(s_x, mask)
+        _, _, supp_feat_2, supp_feat_3, supp_feat_4, supp_feat_5 = self.extract_feats(s_x, mask)
 
         # 拼接 stage 2 和 stage 3 的特征，并通过下采样投影层融合
         supp_feat_cnn = torch.cat([supp_feat_3, supp_feat_2], 1)
@@ -286,76 +607,77 @@ class OneModel(nn.Module):
         # 按 shot 维度拆分为独立列表，便于逐样本处理
         supp_feat_list_ori = [supp_feat_item[:, i, ...] for i in range(self.shot)]
 
-        # # ==================== CLIP 特征提取 ====================
-        # # 对支持集图像应用掩膜，仅保留前景区域用于 CLIP 编码
-        # if mask is not None:
-        #     tmp_mask = F.interpolate(mask, size=x.shape[-2], mode='nearest')
-        #     s_x_mask = s_x * tmp_mask
-        # # 使用 CLIP 的 Vision Transformer 提取支持集和查询集的多层特征及注意力图
-        # tmp_supp_clip_fts, supp_attn_maps = self.clip_model.encode_image(s_x_mask, h, w, extract=True)[:]
-        # tmp_que_clip_fts, que_attn_maps = self.clip_model.encode_image(x, h, w, extract=True)[:]
+        # ==================== CLIP 特征提取 ====================
+        # 文本视觉先验只需要 query CLIP 特征；MI-CoCluster VVP 还需要
+        # support CLIP 特征。两个分支可以同时开启，共享同一次 query
+        # CLIP 前向，避免重复提取 query 特征。
+        # 这些分支没有可训练参数，因此显式关闭梯度以降低显存和计算开销。
+        que_clip_feat_all = None
+        supp_clip_feat_all = None
+        if self.use_text_visual_pyramid or self.use_mi_cocluster_vvp:
+            with torch.no_grad():
+                tmp_que_clip_fts, _ = self.clip_model.encode_image(x, h, w, extract=True,)[:]
 
-        # # 移除 CLS token（索引 0），仅保留 patch token 用于密集预测
-        # supp_clip_fts = [ss[1:, :, :] for ss in tmp_supp_clip_fts]
-        # que_clip_fts = [ss[1:, :, :] for ss in tmp_que_clip_fts]
+                patch_size = getattr(self.clip_model.visual, "patch_size", 16, )
+                que_clip_feat_all = self._reshape_clip_feature_layers(
+                    tmp_que_clip_fts,
+                    h,
+                    w,
+                    patch_size=patch_size,
+                )
 
-        # # 将特征从 [n_patches, bs, dim] 重排为 [bs, dim, n_patches]，再重塑为 2D 空间网格 [bs, dim, h, w]
-        # tmp_supp_clip_feat_all = [ss.permute(1, 2, 0) for ss in supp_clip_fts]
-        # supp_clip_feat_all = [aw.reshape(
-        #     tmp_supp_clip_feat_all[0].shape[0], tmp_supp_clip_feat_all[0].shape[1], int(math.sqrt(tmp_supp_clip_feat_all[0].shape[2])),
-        #     int(math.sqrt(tmp_supp_clip_feat_all[0].shape[2]))).float()
-        #     for aw in tmp_supp_clip_feat_all]
+                if self.use_mi_cocluster_vvp:
+                    support_h, support_w = s_x.shape[-2:]
+                    tmp_supp_clip_fts, _ = self.clip_model.encode_image(
+                        s_x,
+                        support_h,
+                        support_w,
+                        extract=True,
+                    )[:]
+                    supp_clip_feat_all = self._reshape_clip_feature_layers(
+                        tmp_supp_clip_fts,
+                        support_h,
+                        support_w,
+                        patch_size=patch_size,
+                    )
 
-        # tmp_que_clip_feat_all = [qq.permute(1, 2, 0) for qq in que_clip_fts]
-        # que_clip_feat_all = [aw.reshape(
-        #     tmp_que_clip_feat_all[0].shape[0], tmp_que_clip_feat_all[0].shape[1], int(math.sqrt(tmp_que_clip_feat_all[0].shape[2])),
-        #     int(math.sqrt(tmp_que_clip_feat_all[0].shape[2]))).float()
-        #     for aw in tmp_que_clip_feat_all]
-
-        # # ==================== VVP: 视觉-视觉原型相似度 ====================
-        # # 利用 CLIP 深层特征（索引 10、11）计算查询集与支持集之间的视觉相似度图
-        # if self.shot == 1:
-        #     # 单样本设置：直接计算查询与支持的相似度
-        #     similarity2 = get_similarity(que_clip_feat_all[10], supp_clip_feat_all[10], s_y)
-        #     similarity1 = get_similarity(que_clip_feat_all[11], supp_clip_feat_all[11], s_y)
-        # else:
-        #     # 多样本设置：对每个 shot 分别计算相似度，然后沿通道拼接
-        #     mask = rearrange(mask, "(b n) c h w -> b n c h w", n=self.shot)
-        #     supp_clip_feat_all = [rearrange(ss, "(b n) c h w -> b n c h w", n=self.shot) for ss in supp_clip_feat_all]
-        #     clip_similarity_1 = [get_similarity(que_clip_feat_all[11], supp_clip_feat_all[11][:, i, ...], mask=mask[:, i, ...]) for i in
-        #                    range(self.shot)]
-        #     clip_similarity_2 = [get_similarity(que_clip_feat_all[10], supp_clip_feat_all[10][:, i, ...], mask=mask[:, i, ...]) for i in
-        #                    range(self.shot)]
-        #     mask = rearrange(mask, "b n c h w -> (b n) c h w")
-        #     similarity1 = torch.cat(clip_similarity_1, dim=1)
-        #     similarity2 = torch.cat(clip_similarity_2, dim=1)
-        # # 将两个层的相似度拼接，并上采样到 CNN 特征图的尺寸以进行融合
-        # clip_similarity = torch.cat([similarity1, similarity2], dim=1).cuda()
-        # clip_similarity = F.interpolate(clip_similarity, size=(supp_feat_cnn.shape[2], supp_feat_cnn.shape[3]), mode='bilinear', align_corners=True)
-        if self.shot == 1:
-            similarity1 = get_similarity(query_feat_5, supp_feat_5, mask)
-            similarity2 = get_similarity(query_feat_4, supp_feat_4, mask)
-            similarity = torch.cat([similarity1, similarity2], dim=1)
+        # ==================== VVP 相似度生成 ====================
+        # MI-CoCluster VVP 与原 CNN VVP 二选一，不使用残差相加。
+        if self.use_mi_cocluster_vvp:
+            # 使用 CLIP 第 9、10 层 patch 特征生成 MI-VVP。
+            similarity = self.mi_cocluster_vvp(
+                query_layers=(
+                    que_clip_feat_all[8],
+                    que_clip_feat_all[9],
+                ),
+                support_layers=(
+                    supp_clip_feat_all[8],
+                    supp_clip_feat_all[9],
+                ),
+                support_mask=mask,
+                output_size=query_feat_cnn.shape[-2:],
+            )
         else:
-            mask = rearrange(mask, "(b n) c h w -> b n c h w", n=self.shot)
-            supp_feat_5 = rearrange(supp_feat_5, "(b n) c h w -> b n c h w", n=self.shot)
-            supp_feat_4 = rearrange(supp_feat_4, "(b n) c h w -> b n c h w", n=self.shot)
-            clip_similarity_1 = [get_similarity(query_feat_5, supp_feat_5[:, i, ...], mask=mask[:, i, ...]) for i in range(self.shot)]
-            clip_similarity_2 = [get_similarity(query_feat_4, supp_feat_4[:, i, ...], mask=mask[:, i, ...]) for i in range(self.shot)]
-            similarity1 = torch.cat(clip_similarity_1, dim=1)
-            similarity2 = torch.cat(clip_similarity_2, dim=1)
-            similarity = torch.cat([similarity1, similarity2], dim=1)
+            # 原 CNN stage-4/5 VVP 回退分支。
+            similarity = self._build_cnn_vvp(
+                query_feat_4,
+                query_feat_5,
+                supp_feat_4,
+                supp_feat_5,
+                mask,
+            )
 
-        # # ==================== VTP: 视觉-文本原型 CAM ====================
-        # # 使用 GradCAM 基于 CLIP 文本特征（前景/背景描述）生成类别激活图
-        # target_layers = [self.clip_model.visual.transformer.resblocks[-1].ln_1]
-        # cam = GradCAM(model=self.clip_model, target_layers=target_layers, reshape_transform=reshape_transform)
-        # img_cam_list = get_img_cam(x_cv2, que_name, class_name, self.clip_model, self.bg_text_features, self.fg_text_features, cam, self.annotation_root, self.training)
-        # # 将 CAM 上采样到与 CNN 特征图一致的尺寸
-        # img_cam_list = [F.interpolate(t_img_cam.unsqueeze(0).unsqueeze(0), size=(supp_feat_cnn.shape[2], supp_feat_cnn.shape[3]), mode='bilinear',
-        #                               align_corners=True) for t_img_cam in img_cam_list]
-        # img_cam = torch.cat(img_cam_list, 0)
-        # img_cam = img_cam.repeat(1,2,1,1)
+        # ====================================================================
+        # 文本-视觉多粒度相似度金字塔
+        # ====================================================================
+        text_visual_prior = None
+        if self.use_text_visual_pyramid:
+            text_visual_prior = self._build_text_visual_prior(
+                que_clip_feat_all,
+                class_name,
+                cat_idx,
+                output_size=similarity.shape[-2:],
+            )
 
         # ==================== 支持集特征处理 ====================
         # 对支持集 CNN 特征进行加权全局平均池化（以 mask 为权重），得到原型向量
@@ -397,15 +719,29 @@ class OneModel(nn.Module):
         # 将多 shot 的支持集原型特征取平均，得到单一的原型表示
         supp_feat_bin = rearrange(supp_feat_bin, "(b n) c h w -> b n c h w", n=self.shot)
         supp_feat_bin = torch.mean(supp_feat_bin, dim=1)
-        # 拼接查询特征、支持原型、CAM 和 VVP 相似度，送入 query_merge 融合
-        query_feat = self.query_merge(torch.cat([query_feat_cnn, supp_feat_bin, similarity * 10], dim=1))
+
+        # 拼接查询特征、支持原型、VVP 相似度和文本视觉先验，送入 query_merge。
+        # 原 VVP 相似度、支持原型和 CNN 特征的训练信号。
+        query_merge_features = [query_feat_cnn, supp_feat_bin, similarity * 10]
+        if text_visual_prior is not None:
+            query_merge_features.append(
+                (text_visual_prior * 10).to(dtype=query_feat_cnn.dtype)
+            )
+        query_feat = self.query_merge(
+            torch.cat(query_merge_features, dim=1)
+        )
 
         # ==================== Transformer 解码 & 基类分类器 ====================
-        # 通过交叉注意力 Transformer 生成元学习的预测结果及中间注意力权重
-        meta_out, weights = self.transformer(query_feat, supp_feat, mask, similarity)
+        # Transformer 仅使用 VVP 相似度，VTP 只在 query_merge 中作为先验。
+        meta_out, weights = self.transformer(
+            query_feat,
+            supp_feat,
+            mask,
+            similarity=similarity,
+        )
+
         # 基类分类器使用最高层 CNN 特征预测基类概率
         base_out = self.base_learnear(query_feat_5)
-
         meta_out_soft = meta_out.softmax(1)
         base_out_soft = base_out.softmax(1)
 
@@ -486,16 +822,27 @@ class OneModel(nn.Module):
         return loss
 
     def get_optim(self, model, args, LR):
+        parameter_groups = [
+            {'params': model.transformer.mix_transformer.parameters()},
+            {'params': model.supp_merge.parameters(), "lr": LR * 10},
+            {'params': model.query_merge.parameters(), "lr": LR * 10},
+            {'params': model.cls_merge.parameters(), "lr": LR * 10},
+            {'params': model.down_supp.parameters(), "lr": LR * 10},
+            {'params': model.down_query.parameters(), "lr": LR * 10},
+            {'params': model.gram_merge.parameters(), "lr": LR * 10},
+        ]
+        if model.mi_cocluster_vvp is not None and getattr(
+            args, "use_learnable_fusion", False
+        ):
+            parameter_groups.append(
+                {'params': model.mi_cocluster_vvp.parameters()}
+            )
         optimizer = torch.optim.AdamW(
-            [
-                {'params': model.transformer.mix_transformer.parameters()},
-                {'params': model.supp_merge.parameters(), "lr": LR * 10},
-                {'params': model.query_merge.parameters(), "lr": LR * 10},
-                {'params': model.cls_merge.parameters(), "lr": LR * 10},
-                {'params': model.down_supp.parameters(), "lr": LR * 10},
-                {'params': model.down_query.parameters(), "lr": LR * 10},
-                {'params': model.gram_merge.parameters(), "lr": LR * 10},
-            ], lr=LR, weight_decay=args.weight_decay, betas=(0.9, 0.999))
+            parameter_groups,
+            lr=LR,
+            weight_decay=args.weight_decay,
+            betas=(0.9, 0.999),
+        )
         return optimizer
 
     def freeze_modules(self, model):
@@ -532,4 +879,3 @@ class OneModel(nn.Module):
             feat = self.cls(feat)
             results.append(feat)
         return results
-    
